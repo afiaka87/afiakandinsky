@@ -14,6 +14,7 @@ from .models.vae import build_vae
 from .models.parallelize import parallelize_dit
 from .t2v_pipeline import Kandinsky5T2VPipeline
 from .magcache_utils import set_magcache_params
+from .device_utils import is_cuda_available, get_device_type
 
 from safetensors.torch import load_file
 
@@ -33,6 +34,7 @@ def get_T2V_pipeline(
     magcache: bool = False,
     quantized_qwen: bool = False,
     attention_engine: str = "auto",
+    vae_decode_tile_size: Optional[int] = None,
 ) -> Kandinsky5T2VPipeline:
     assert resolution in [512]
 
@@ -49,6 +51,11 @@ def get_T2V_pipeline(
     assert not (world_size > 1 and offload), "Offloading available only with not parallel inference"
 
     if world_size > 1:
+        if not is_cuda_available():
+            raise RuntimeError(
+                "Distributed inference (world_size > 1) requires CUDA. "
+                "Use single-GPU/CPU inference instead."
+            )
         device_mesh = init_device_mesh(
             "cuda", (world_size,), mesh_dim_names=("tensor_parallel",)
         )
@@ -97,10 +104,10 @@ def get_T2V_pipeline(
     conf.model.dit_params.attention_engine = attention_engine
 
     text_embedder = get_text_embedder(conf.model.text_embedder, device=device_map["text_embedder"], quantized_qwen=quantized_qwen)
-    if not offload: 
-        text_embedder = text_embedder.to( device=device_map["text_embedder"]) 
-    
-    vae = build_vae(conf.model.vae)
+    if not offload:
+        text_embedder = text_embedder.to( device=device_map["text_embedder"])
+
+    vae = build_vae(conf.model.vae, device=device_map["vae"])
     vae = vae.eval()
     if not offload:
         vae = vae.to(device=device_map["vae"]) 
@@ -134,6 +141,7 @@ def get_T2V_pipeline(
         world_size=world_size,
         conf=conf,
         offload=offload,
+        vae_decode_tile_size=vae_decode_tile_size,
     )
 
 
