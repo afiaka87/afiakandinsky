@@ -2,10 +2,18 @@ import argparse
 import time
 import warnings
 import logging
+import os
 
 import torch
 
 from kandinsky import get_T2V_pipeline
+from kandinsky.device_utils import (
+    get_default_device,
+    get_device_from_string,
+    is_cuda_available,
+    is_mps_available,
+    log_device_info,
+)
 
 
 def validate_args(args):
@@ -132,7 +140,24 @@ def parse_args():
         help="Name of the full attention algorithm to use for <=5 second generation",
         choices=["flash_attention_2", "flash_attention_3", "sdpa", "sage", "auto"]
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to use: 'auto' (default), 'cuda', 'cuda:0', 'cuda:1', 'mps', or 'cpu'"
+    )
+    parser.add_argument(
+        "--vae_decode_tile_size",
+        type=int,
+        default=None,
+        help="Override VAE temporal tile size for memory management (default: auto, min: 1). Smaller values use less memory but are slower."
+    )
     args = parser.parse_args()
+
+    # Validate vae_decode_tile_size if provided
+    if args.vae_decode_tile_size is not None and args.vae_decode_tile_size < 1:
+        raise ValueError("--vae_decode_tile_size must be >= 1")
+
     return args
 
 
@@ -141,14 +166,53 @@ if __name__ == "__main__":
     args = parse_args()
     validate_args(args)
 
+    # Check for distributed training incompatibility
+    if "LOCAL_RANK" in os.environ or args.local_rank is not None:
+        if not is_cuda_available():
+            raise RuntimeError(
+                "Distributed inference requires CUDA. "
+                "Use single-GPU inference with CUDA or CPU inference: python test.py --device cuda or python test.py --device cpu"
+            )
+
+    # Auto-detect or parse device
+    if args.device.lower() == "auto":
+        device = get_default_device()
+        device_str = str(device)
+    else:
+        device = get_device_from_string(args.device)
+        device_str = str(device)
+
+    print(f"Using device: {device_str}")
+    log_device_info(device)
+
+    # Disable quantization on non-CUDA devices (requires special compilation on ARM/CPU)
+    quantized_qwen = args.qwen_quantization and is_cuda_available()
+    if args.qwen_quantization and not is_cuda_available():
+        print("Warning: Qwen quantization requires CUDA. Disabling quantization.")
+
+    # Validate MPS limitations
+    if is_mps_available() and device.type == "mps":
+        if args.video_duration > 5:
+            raise RuntimeError(
+                "10-second videos are not yet supported on MPS (Metal Performance Shaders). "
+                "Use 5-second videos instead: python test.py --video_duration 5 --device mps"
+            )
+        if args.attention_engine not in ["sdpa", "auto"]:
+            print(f"Warning: Attention engine '{args.attention_engine}' is not available on MPS. "
+                  f"Using SDPA (default) instead.")
+            args.attention_engine = "auto"
+
+    # Create device map using detected device
+    device_map = {"dit": device_str, "vae": device_str, "text_embedder": device_str}
+
     pipe = get_T2V_pipeline(
-        device_map={"dit": "cuda:0", "vae": "cuda:0",
-                    "text_embedder": "cuda:0"},
+        device_map=device_map,
         conf_path=args.config,
         offload=args.offload,
         magcache=args.magcache,
-        quantized_qwen=args.qwen_quantization,
+        quantized_qwen=quantized_qwen,
         attention_engine=args.attention_engine,
+        vae_decode_tile_size=args.vae_decode_tile_size,
     )
 
     if args.output_filename is None:
