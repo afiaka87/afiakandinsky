@@ -18,7 +18,7 @@ def freeze(model):
     return model
 
 
-@torch.autocast(device_type="cuda", enabled=False)
+# Disable autocast for numerical stability in frequency calculations
 def get_freqs(dim, max_period=10000.0):
     freqs = torch.exp(
         -math.log(max_period)
@@ -149,7 +149,7 @@ def nablaT_v2(
     map = torch.softmax(map / math.sqrt(D), dim=-1)
     # Map binarization
     vals, inds = map.sort(-1)
-    cvals = vals.cumsum_(-1)
+    cvals = vals.cumsum(-1)
     mask = (cvals >= 1 - thr).int()
     mask = mask.gather(-1, inds.argsort(-1))
 
