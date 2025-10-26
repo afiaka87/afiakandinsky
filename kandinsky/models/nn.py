@@ -1,4 +1,5 @@
 import math
+from functools import wraps
 
 import torch
 from torch import nn
@@ -7,23 +8,78 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from .utils import get_freqs, nablaT_v2
 from.attention import SelfAttentionEngine
+from ..device_utils import (
+    is_cuda_available,
+    is_mps_available,
+    get_device_type,
+    get_dtype_for_device,
+    compile_if_cuda
+)
 
-@torch.compile()
-@torch.autocast(device_type="cuda", dtype=torch.float32)
+
+def autocast_decorator(dtype=torch.float32, enabled=True):
+    """
+    Device-aware autocast decorator that works on CUDA, MPS, and CPU.
+
+    On CUDA: uses torch.autocast with device_type="cuda" and specified dtype
+    On MPS: uses torch.autocast with device_type="mps" and float16 (MPS doesn't support bfloat16)
+    On CPU: no-op wrapper (autocast not beneficial for CPU)
+    """
+    def decorator(func):
+        if is_cuda_available():
+            # CUDA available: use autocast with specified dtype
+            decorated = torch.autocast(device_type="cuda", dtype=dtype, enabled=enabled)(func)
+        elif is_mps_available():
+            # MPS available: use autocast with float16 (MPS doesn't support bfloat16)
+            mps_dtype = torch.float16 if dtype != torch.float32 else torch.float32
+            decorated = torch.autocast(device_type="mps", dtype=mps_dtype, enabled=enabled)(func)
+        else:
+            # CPU: skip autocast (not beneficial)
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            decorated = wrapper
+        return decorated
+    return decorator
+
+
+def get_output_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """
+    Determine appropriate output dtype based on device.
+
+    For CUDA: bfloat16
+    For MPS: float16 (MPS doesn't support bfloat16)
+    For CPU: float32
+
+    Args:
+        tensor: Input tensor to extract device from
+
+    Returns:
+        torch.dtype appropriate for the tensor's device
+    """
+    device = tensor.device
+    return get_dtype_for_device(device)
+
+
+@compile_if_cuda()
+@autocast_decorator(dtype=torch.float32)
 def apply_scale_shift_norm(norm, x, scale, shift):
-    return (norm(x) * (scale + 1.0) + shift).to(torch.bfloat16)
+    result = norm(x) * (scale + 1.0) + shift
+    return result.to(get_output_dtype(result))
 
-@torch.compile()
-@torch.autocast(device_type="cuda", dtype=torch.float32)
+@compile_if_cuda()
+@autocast_decorator(dtype=torch.float32)
 def apply_gate_sum(x, out, gate):
-    return (x + gate * out).to(torch.bfloat16)
+    result = x + gate * out
+    return result.to(get_output_dtype(result))
 
-@torch.compile()
-@torch.autocast(device_type="cuda", enabled=False)
+@compile_if_cuda()
+@autocast_decorator(dtype=torch.float32, enabled=False)
 def apply_rotary(x, rope):
     x_ = x.reshape(*x.shape[:-1], -1, 1, 2).to(torch.float32)
     x_out = (rope * x_).sum(dim=-1)
-    return x_out.reshape(*x.shape).to(torch.bfloat16)
+    result = x_out.reshape(*x.shape)
+    return result.to(get_output_dtype(result))
 
 
 class TimeEmbeddings(nn.Module):
@@ -39,7 +95,7 @@ class TimeEmbeddings(nn.Module):
         self.activation = nn.SiLU()
         self.out_layer = nn.Linear(time_dim, time_dim, bias=True)
 
-    @torch.autocast(device_type="cuda", dtype=torch.float32)
+    @autocast_decorator(dtype=torch.float32)
     def forward(self, time):
         args = torch.outer(time, self.freqs.to(device=time.device))
         time_embed = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
@@ -92,7 +148,7 @@ class RoPE1D(nn.Module):
         pos = torch.arange(max_pos, dtype=freq.dtype)
         self.register_buffer(f"args", torch.outer(pos, freq), persistent=False)
 
-    @torch.autocast(device_type="cuda", enabled=False)
+    @autocast_decorator(enabled=False)
     def forward(self, pos):
         args = self.args[pos]
         cosine = torch.cos(args)
@@ -114,7 +170,7 @@ class RoPE3D(nn.Module):
             pos = torch.arange(ax_max_pos, dtype=freq.dtype)
             self.register_buffer(f"args_{i}", torch.outer(pos, freq), persistent=False)
 
-    @torch.autocast(device_type="cuda", enabled=False)
+    @autocast_decorator(dtype=torch.float32, enabled=False)
     def forward(self, shape, pos, scale_factor=(1.0, 1.0, 1.0)):
         duration, height, width = shape
         args_t = self.args_0[pos[0]] / scale_factor[0]
@@ -144,8 +200,8 @@ class Modulation(nn.Module):
         self.out_layer.weight.data.zero_()
         self.out_layer.bias.data.zero_()
 
-    @torch.compile()
-    @torch.autocast(device_type="cuda", dtype=torch.float32)
+    @compile_if_cuda()
+    @autocast_decorator(dtype=torch.float32)
     def forward(self, x):
         return self.out_layer(self.activation(x))
 
@@ -165,7 +221,7 @@ class MultiheadSelfAttentionEnc(nn.Module):
 
         self.attn_engine = SelfAttentionEngine(attention_engine)
 
-    @torch.compile()
+    @compile_if_cuda()
     def get_qkv(self, x):
         query = self.to_query(x)
         key = self.to_key(x)
@@ -178,13 +234,13 @@ class MultiheadSelfAttentionEnc(nn.Module):
 
         return query, key, value
 
-    @torch.compile()
+    @compile_if_cuda()
     def norm_qk(self, q, k):
         q = self.query_norm(q.float()).type_as(q)
         k = self.key_norm(k.float()).type_as(k)
         return q, k
 
-    @torch.compile()
+    @compile_if_cuda()
     def scaled_dot_product_attention(self, query, key, value):
         out = self.attn_engine.get_attention()(
             q=query.unsqueeze(0),
@@ -192,7 +248,7 @@ class MultiheadSelfAttentionEnc(nn.Module):
             v=value.unsqueeze(0))[0].flatten(-2, -1)
         return out
 
-    @torch.compile()
+    @compile_if_cuda()
     def out_l(self, x):
         return self.out_layer(x)
 
@@ -223,7 +279,7 @@ class MultiheadSelfAttentionDec(nn.Module):
 
         self.attn_engine = SelfAttentionEngine(attention_engine)
 
-    @torch.compile()
+    @compile_if_cuda()
     def get_qkv(self, x):
         query = self.to_query(x)
         key = self.to_key(x)
@@ -236,13 +292,13 @@ class MultiheadSelfAttentionDec(nn.Module):
 
         return query, key, value
 
-    @torch.compile()
+    @compile_if_cuda()
     def norm_qk(self, q, k):
         q = self.query_norm(q.float()).type_as(q)
         k = self.key_norm(k.float()).type_as(k)
         return q, k
 
-    @torch.compile()
+    @compile_if_cuda()
     def attention(self, query, key, value):
         out = self.attn_engine.get_attention()(
             q=query.unsqueeze(0),
@@ -250,7 +306,7 @@ class MultiheadSelfAttentionDec(nn.Module):
             v=value.unsqueeze(0))[0].flatten(-2, -1)
         return out
 
-    @torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+    @compile_if_cuda(mode="max-autotune-no-cudagraphs", dynamic=True)
     def nabla(self, query, key, value, sparse_params=None):
         query = query.unsqueeze(0).transpose(1, 2).contiguous()
         key = key.unsqueeze(0).transpose(1, 2).contiguous()
@@ -275,7 +331,7 @@ class MultiheadSelfAttentionDec(nn.Module):
         out = out.flatten(-2, -1)
         return out
 
-    @torch.compile()
+    @compile_if_cuda()
     def out_l(self, x):
         return self.out_layer(x)
 
@@ -310,7 +366,7 @@ class MultiheadCrossAttention(nn.Module):
 
         self.attn_engine = SelfAttentionEngine(attention_engine)
 
-    @torch.compile()
+    @compile_if_cuda()
     def get_qkv(self, x, cond):
         query = self.to_query(x)
         key = self.to_key(cond)
@@ -323,13 +379,13 @@ class MultiheadCrossAttention(nn.Module):
 
         return query, key, value
 
-    @torch.compile()
+    @compile_if_cuda()
     def norm_qk(self, q, k):
         q = self.query_norm(q.float()).type_as(q)
         k = self.key_norm(k.float()).type_as(k)
         return q, k
 
-    @torch.compile()
+    @compile_if_cuda()
     def attention(self, query, key, value):
         out = self.attn_engine.get_attention()(
             q=query.unsqueeze(0),
@@ -337,7 +393,7 @@ class MultiheadCrossAttention(nn.Module):
             v=value.unsqueeze(0))[0].flatten(-2, -1)
         return out
 
-    @torch.compile()
+    @compile_if_cuda()
     def out_l(self, x):
         return self.out_layer(x)
 
