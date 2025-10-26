@@ -21,6 +21,7 @@ class Kandinsky5T2VPipeline:
         world_size: int = 1,
         conf = None,
         offload: bool = False,
+        vae_decode_tile_size: int = None,
     ):
         if resolution not in [512]:
             raise ValueError("Resolution can be only 512")
@@ -39,6 +40,7 @@ class Kandinsky5T2VPipeline:
         self.guidance_weight = conf.model.guidance_weight
 
         self.offload = offload
+        self.vae_decode_tile_size = vae_decode_tile_size
 
         self.RESOLUTIONS = {
             512: [(512, 512), (512, 768), (768, 512)],
@@ -157,7 +159,8 @@ class Kandinsky5T2VPipeline:
             vae_device=self.device_map["vae"],
             text_embedder_device=self.device_map["text_embedder"],
             progress=progress,
-            offload=self.offload
+            offload=self.offload,
+            vae_decode_tile_size=self.vae_decode_tile_size
         )
         torch.cuda.empty_cache()
 
