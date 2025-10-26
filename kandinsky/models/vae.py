@@ -16,12 +16,16 @@ from diffusers.models.autoencoders.vae import (
     DecoderOutput,
     DiagonalGaussianDistribution,
 )
+from ..device_utils import empty_cache, compile_if_cuda, get_dtype_for_device
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# CUDA-specific optimizations
+if torch.cuda.is_available():
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
 
 OPT_TEMPORAL_TILING = {
     1: (1, 1),
@@ -181,7 +185,7 @@ class HunyuanVideoUpsampleCausal3D(nn.Module):
         self.conv = HunyuanVideoCausalConv3d(
             in_channels, out_channels, kernel_size, stride, bias=bias
         )
-    @torch.compile(dynamic=True)
+    @compile_if_cuda(dynamic=True)
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_frames = hidden_states.size(2)
         dtp = hidden_states.dtype
@@ -200,7 +204,7 @@ class HunyuanVideoUpsampleCausal3D(nn.Module):
             hidden_states = torch.cat((first_frame, other_frames), dim=2)
             del first_frame
             del other_frames
-            torch.cuda.empty_cache()
+            empty_cache()
         else:
             hidden_states = first_frame
 
@@ -257,7 +261,7 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
             self.conv_shortcut = HunyuanVideoCausalConv3d(
                 in_channels, out_channels, 1, 1, 0
             )
-    @torch.compile(dynamic=True)
+    @compile_if_cuda(dynamic=True)
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         dtp = hidden_states.dtype
         hidden_states = hidden_states.contiguous()
@@ -795,6 +799,24 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin):
         self.tile_sample_stride_num_frames = 12
 
         self.tile_size = None
+        self._manual_tile_override = False
+
+    def set_temporal_tile_size(self, tile_size: Optional[int] = None):
+        """
+        Override temporal tiling size for memory management.
+
+        Args:
+            tile_size: Number of frames per tile (None = use default)
+                       Minimum value is 1.
+        """
+        if tile_size is not None:
+            tile_size = max(1, tile_size)  # Enforce minimum
+            self.tile_sample_min_num_frames = tile_size
+            # Maintain ~75% stride ratio (12/16 = 0.75)
+            self.tile_sample_stride_num_frames = max(1, int(tile_size * 0.75))
+            self._manual_tile_override = True
+        else:
+            self._manual_tile_override = False
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         _, _, num_frames, height, width = x.shape
@@ -897,10 +919,12 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin):
                 If return_dict is True, a [`~models.vae.DecoderOutput`] is returned,
                 otherwise a plain `tuple` is returned.
         """
-        tile_size, tile_stride = self.get_dec_optimal_tiling(z.shape)
-        if tile_size != self.tile_size:
-            self.tile_size = tile_size
-            self.apply_tiling(tile_size, tile_stride)
+        # Skip optimal tiling if manual override is set
+        if not self._manual_tile_override:
+            tile_size, tile_stride = self.get_dec_optimal_tiling(z.shape)
+            if tile_size != self.tile_size:
+                self.tile_size = tile_size
+                self.apply_tiling(tile_size, tile_stride)
 
         decoded = self._decode(z).sample
 
@@ -1277,10 +1301,11 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin):
         return self.get_enc_optimal_tiling(enc_inp_shape)
 
 
-def build_vae(conf):
+def build_vae(conf, device="cpu"):
     if conf.name == "hunyuan":
+        model_dtype = get_dtype_for_device(device)
         return AutoencoderKLHunyuanVideo.from_pretrained(
-            conf.checkpoint_path, subfolder="vae", torch_dtype=torch.float16
+            conf.checkpoint_path, subfolder="vae", torch_dtype=model_dtype
         )
     else:
         assert False, f"unknown vae name {conf.name}"
