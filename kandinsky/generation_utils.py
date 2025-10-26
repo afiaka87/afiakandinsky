@@ -2,9 +2,10 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "False"
 
 import torch
-from tqdm import tqdm 
+from tqdm import tqdm
 
 from .models.utils import fast_sta_nabla
+from .device_utils import empty_cache, get_device_type
 
 
 def get_sparse_params(conf, batch_embeds, device):
@@ -94,7 +95,7 @@ def generate(
     progress=False,
     seed=6554,
 ):
-    g = torch.Generator(device="cuda")
+    g = torch.Generator(device=device)
     g.manual_seed(seed)
     img = torch.randn(*shape, device=device, generator=g)
 
@@ -146,6 +147,7 @@ def generate_sample(
     text_embedder_device="cuda",
     progress=True,
     offload=False,
+    vae_decode_tile_size=None,
 ):
     bs, duration, height, width, dim = shape
     if duration == 1:
@@ -180,9 +182,9 @@ def generate_sample(
 
     if offload:
         dit.to(device, non_blocking=True)
-        
+
     with torch.no_grad():
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=get_device_type(device), dtype=torch.bfloat16):
             latent_visual = generate(
                 dit,
                 device,
@@ -202,13 +204,17 @@ def generate_sample(
             
     if offload:
         dit = dit.to('cpu', non_blocking=True)
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     if offload:
         vae = vae.to(vae_device, non_blocking=True)
 
+    # Apply manual tile size override if provided
+    if vae_decode_tile_size is not None:
+        vae.set_temporal_tile_size(vae_decode_tile_size)
+
     with torch.no_grad():
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=get_device_type(vae_device), dtype=torch.bfloat16):
             images = latent_visual.reshape(
                 bs,
                 -1,
@@ -223,6 +229,6 @@ def generate_sample(
 
     if offload:
         vae = vae.to('cpu', non_blocking=True)
-    torch.cuda.empty_cache()
+    empty_cache(vae_device)
 
     return images
