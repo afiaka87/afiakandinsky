@@ -1,6 +1,7 @@
 # This is an adaptation of Magcache from https://github.com/Zehong-Ma/MagCache/
 import numpy as np
 import torch
+from .device_utils import compile_if_cuda
 
 
 def nearest_interp(src_array, target_length):
@@ -37,7 +38,7 @@ def set_magcache_params(dit, mag_ratios, num_steps, no_cfg):
         dit.mag_ratios = interpolated_mag_ratios
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs")
+@compile_if_cuda(mode="max-autotune-no-cudagraphs")
 def magcache_forward(
     self,
     x,
