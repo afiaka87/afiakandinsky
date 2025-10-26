@@ -2,3 +2,7 @@
 **/weights/**
 .venv/
 .python-version
+CLAUDE.md
+logs/
+runk5.sh
+test_mps.sh
