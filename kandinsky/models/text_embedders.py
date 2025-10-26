@@ -8,11 +8,16 @@ from transformers import (
 )
 
 from .utils import freeze
+from ..device_utils import is_cuda_available, is_mps_available, get_dtype_for_device
 
 
 class ClipTextEmbedder:
     def __init__(self, conf, device):
-        self.model = CLIPTextModel.from_pretrained(conf.checkpoint_path).to(device)
+        model_dtype = get_dtype_for_device(device)
+        self.model = CLIPTextModel.from_pretrained(
+            conf.checkpoint_path,
+            torch_dtype=model_dtype
+        ).to(device)
         self.model = freeze(self.model)
         self.tokenizer = CLIPTokenizer.from_pretrained(conf.checkpoint_path)
         self.max_length = conf.max_length
@@ -54,18 +59,26 @@ class Qwen2_5_VLTextEmbedder:
     }
 
     def __init__(self, conf, device, quantized_qwen=False):
+        # Get device-aware dtype
+        model_dtype = get_dtype_for_device(device)
+
         quantization_config = None
         if quantized_qwen:
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4"
-            )
-            
+            if not is_cuda_available():
+                print("Warning: Qwen2.5-VL quantization requires CUDA. Disabling quantization.")
+                quantized_qwen = False
+            else:
+                # Use bfloat16 for quantization compute dtype (CUDA only)
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4"
+                )
+
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             conf.checkpoint_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
             device_map=device,
             quantization_config=quantization_config
         )
