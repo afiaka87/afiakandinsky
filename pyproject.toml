@@ -1,0 +1,42 @@
+[project]
+name = "kandinsky-5"
+version = "0.1.0"
+description = "Lightweight text-to-video generation with latent diffusion and flow matching"
+readme = "README.md"
+requires-python = ">=3.12.3"
+dependencies = [
+    "torch>=2.8.0",
+    "torchvision",
+    "transformers>=4.56.2",
+    "diffusers",
+    "accelerate",
+    "einops",
+    "imageio",
+    "imageio-ffmpeg",
+    "opencv-python",
+    "sentencepiece",
+    "tqdm",
+    "av",
+    "omegaconf",
+    "ninja",
+    "numpy",
+    "pillow",
+    "packaging",
+    "requests",
+    "anyio",
+    "pydantic",
+    "aiohttp",
+    "websocket-client",
+    "beautifulsoup4",
+]
+
+[project.optional-dependencies]
+cuda = ["bitsandbytes"]
+dev = [
+    "pytest",
+    "ipykernel",
+    "ipywidgets",
+]
+
+[tool.uv]
+managed = true
