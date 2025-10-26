@@ -5,7 +5,7 @@ import torch
 from tqdm import tqdm
 
 from .models.utils import fast_sta_nabla
-from .device_utils import empty_cache, get_device_type
+from .device_utils import empty_cache, get_device_type, get_dtype_for_device
 
 
 def get_sparse_params(conf, batch_embeds, device):
@@ -184,7 +184,7 @@ def generate_sample(
         dit.to(device, non_blocking=True)
 
     with torch.no_grad():
-        with torch.autocast(device_type=get_device_type(device), dtype=torch.bfloat16):
+        with torch.autocast(device_type=get_device_type(device), dtype=get_dtype_for_device(device)):
             latent_visual = generate(
                 dit,
                 device,
@@ -214,7 +214,7 @@ def generate_sample(
         vae.set_temporal_tile_size(vae_decode_tile_size)
 
     with torch.no_grad():
-        with torch.autocast(device_type=get_device_type(vae_device), dtype=torch.bfloat16):
+        with torch.autocast(device_type=get_device_type(vae_device), dtype=get_dtype_for_device(vae_device)):
             images = latent_visual.reshape(
                 bs,
                 -1,
